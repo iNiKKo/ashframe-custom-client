@@ -91,6 +91,68 @@ pub const handShake = struct { // MARK: handShake
 	var assetsLoadedCondition: main.utils.Condition = .{};
 	var hasFinishedLoadingAssets: bool = false;
 	var handshakeZon: ZonElement = undefined;
+	// --- ASHFRAME CUSTOM CLIENT: unpack assets off the network thread. ---
+	var assetsUnpackDone: Atomic(bool) = .init(true);
+	var assetsUnpackFailed: Atomic(bool) = .init(false);
+	var assetsUnpackMutex: main.utils.Mutex = .{};
+
+	const AssetUnpackTask = struct {
+		data: []const u8,
+
+		pub const vtable = utils.ThreadPool.VTable{
+			.getPriority = main.meta.castFunctionSelfToAnyopaque(getPriority),
+			.isStillNeeded = main.meta.castFunctionSelfToAnyopaque(isStillNeeded),
+			.run = main.meta.castFunctionSelfToAnyopaque(run),
+			.clean = main.meta.castFunctionSelfToAnyopaque(clean),
+			.taskType = .misc,
+		};
+
+		pub fn getPriority(_: *AssetUnpackTask) f32 {
+			return std.math.floatMax(f32);
+		}
+
+		pub fn isStillNeeded(_: *AssetUnpackTask) bool {
+			return true;
+		}
+
+		pub fn run(self: *AssetUnpackTask) void {
+			defer self.clean();
+			assetsUnpackMutex.lock();
+			defer assetsUnpackMutex.unlock();
+			main.files.cubyzDir().deleteTree("serverAssets") catch {}; // Delete old assets.
+			var dir = main.files.cubyzDir().openDir("serverAssets") catch |err| {
+				std.log.err("Ashframe client: could not open serverAssets: {s}", .{@errorName(err)});
+				assetsUnpackFailed.store(true, .release);
+				assetsUnpackDone.store(true, .release);
+				return;
+			};
+			defer dir.close();
+			utils.Compression.unpack(dir, self.data) catch |err| {
+				std.log.err("Ashframe client: asset unpack failed: {s}", .{@errorName(err)});
+				assetsUnpackFailed.store(true, .release);
+				assetsUnpackDone.store(true, .release);
+				return;
+			};
+			main.ashframe_client.noteAssetsUnpacked(self.data);
+			assetsUnpackDone.store(true, .release);
+			// --- ASHFRAME CUSTOM CLIENT: timing. ---
+			main.ashframe_client.timingMark("assets unpack done");
+			// --- ASHFRAME CUSTOM CLIENT ---
+		}
+
+		pub fn clean(self: *AssetUnpackTask) void {
+			main.globalAllocator.free(self.data);
+			main.globalAllocator.destroy(self);
+		}
+	};
+
+	pub fn waitForAssetUnpack() !void {
+		while (!assetsUnpackDone.load(.acquire)) {
+			main.io.sleep(.fromMilliseconds(5), .awake) catch {};
+		}
+		if (assetsUnpackFailed.load(.acquire)) return error.AssetUnpackFailed;
+	}
+	// --- ASHFRAME CUSTOM CLIENT ---
 
 	pub fn clientReceive(conn: *Connection, reader: *utils.BinaryReader) !void {
 		const newState = try reader.readEnum(Connection.HandShakeState);
@@ -117,19 +179,38 @@ pub const handShake = struct { // MARK: handShake
 				},
 				.assets => {
 					std.log.info("Received assets.", .{});
+					// --- ASHFRAME CUSTOM CLIENT: timing. ---
+					main.ashframe_client.timingMark("assets pack received");
+					// --- ASHFRAME CUSTOM CLIENT ---
 					// --- ASHFRAME CUSTOM CLIENT: skip unpack if pack unchanged. ---
 					if (main.ashframe_client.checkAssetPack(reader.remaining) == .unchanged) {
 						std.log.info("Ashframe client: asset pack unchanged, keeping serverAssets.", .{});
+						// --- ASHFRAME CUSTOM CLIENT: timing. ---
+						main.ashframe_client.timingMark("assets unpack skipped (cached)");
+						// --- ASHFRAME CUSTOM CLIENT ---
+						assetsUnpackDone.store(true, .release);
+						assetsUnpackFailed.store(false, .release);
 					} else {
-						main.files.cubyzDir().deleteTree("serverAssets") catch {}; // Delete old assets.
-						var dir = try main.files.cubyzDir().openDir("serverAssets");
-						defer dir.close();
-						try utils.Compression.unpack(dir, reader.remaining);
-						main.ashframe_client.noteAssetsUnpacked(reader.remaining);
+						assetsUnpackDone.store(false, .release);
+						assetsUnpackFailed.store(false, .release);
+						const task = main.globalAllocator.create(AssetUnpackTask);
+						errdefer main.globalAllocator.destroy(task);
+						task.* = .{
+							.data = main.globalAllocator.dupe(u8, reader.remaining),
+						};
+						main.threadPool.addTask(task, &AssetUnpackTask.vtable);
+						// noteAssetsUnpacked runs after the background unpack
+						// finishes; finishHandshake waits for it (see below).
+						// --- ASHFRAME CUSTOM CLIENT: timing. ---
+						main.ashframe_client.timingMark("assets unpack dispatched");
+						// --- ASHFRAME CUSTOM CLIENT ---
 					}
 					// --- ASHFRAME CUSTOM CLIENT ---
 				},
 				.serverData => {
+					// --- ASHFRAME CUSTOM CLIENT: timing. ---
+					main.ashframe_client.timingMark("serverData received");
+					// --- ASHFRAME CUSTOM CLIENT ---
 					handshakeZon = ZonElement.parseFromString(main.stackAllocator, null, reader.remaining);
 					defer handshakeZon.deinit(main.stackAllocator);
 					conn.handShakeState.store(.complete, .monotonic);
@@ -270,6 +351,9 @@ pub const handShake = struct { // MARK: handShake
 				defer main.stackAllocator.free(data);
 
 				conn.send(.secure, id, data);
+				// --- ASHFRAME CUSTOM CLIENT: timing. ---
+				main.ashframe_client.timingMark("handshake/userData sent");
+				// --- ASHFRAME CUSTOM CLIENT ---
 			},
 			.reload => {
 				conn.send(.secure, id, &.{@intFromEnum(Connection.HandShakeState.reload)});

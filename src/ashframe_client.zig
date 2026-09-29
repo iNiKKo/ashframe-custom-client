@@ -9,10 +9,29 @@ const main = @import("main");
 
 var dialAddress: ?[]u8 = null;
 
+// --- ASHFRAME CUSTOM CLIENT: join-stage timing (observability only). ---
+// Logs per-stage durations on every connect (vanilla + Ashframe) so slow
+// joins can be attributed to a stage instead of guessed at. No behavior.
+var timingStartMs: i64 = 0;
+var timingLastMs: i64 = 0;
+
+pub fn timingReset() void {
+	timingStartMs = main.timestamp().toMilliseconds();
+	timingLastMs = timingStartMs;
+}
+
+pub fn timingMark(stage: []const u8) void {
+	const now = main.timestamp().toMilliseconds();
+	if (timingStartMs == 0) timingReset();
+	std.log.info("[timing] {s}: +{d}ms (total {d}ms)", .{ stage, now - timingLastMs, now - timingStartMs });
+	timingLastMs = now;
+}
+
 /// Remembers the typed server address. Called from the connecting window.
 pub fn noteDialAddress(ip: []const u8) void {
 	if (dialAddress) |old| main.globalAllocator.free(old);
 	dialAddress = main.globalAllocator.dupe(u8, ip);
+	timingReset();
 }
 
 /// Master toggle on, and dialed address matches the Ashframe server.
