@@ -14,6 +14,18 @@ exactly like stock Cubyz 0.4.1.
 - Faster handshake ramp on high-latency links (send pacing only).
 - Delete `~/.cubyz/ashframeCache/` anytime to force a full redownload.
 
+## Vanilla vs custom client (measured, high-latency link)
+
+| | Vanilla 0.4.1 | Ashframe client |
+|---|---|---|
+| Repeat join | 28–42 s | ~7–13 s |
+| Asset pack re-download | every join (~17–29 s) | skipped when unchanged (~0 s) |
+| Revisit / teleport back | full re-stream | instant from disk |
+| Dark shadows until teleport | yes | no (waits for light data) |
+| Chat width | 256 px fixed | configurable |
+
+First-ever join still downloads everything once; repeats skip it.
+
 ## Install
 
 1. Get clean Cubyz 0.4.1 source (tag `0.4.1`).
@@ -29,4 +41,4 @@ exactly like stock Cubyz 0.4.1.
 ## Notes
 
 - Derived from Cubyz 0.4.1 (GPLv3, see LICENSE).
-- 8 changed files, marked `ASHFRAME CUSTOM CLIENT` in the source.
+- 10 changed files, marked `ASHFRAME CUSTOM CLIENT` in the source.
