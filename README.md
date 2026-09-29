@@ -8,6 +8,8 @@ exactly like stock Cubyz 0.4.1.
 - Skips re-unpacking server addons when they didn't change.
 - Saves downloaded chunks and lighting to disk, reuses them on revisit.
 - Edited areas re-download automatically. Old data expires on its own.
+- Meshes built before their light data arrives are re-lit automatically.
+- Faster handshake ramp on high-latency links (send pacing only).
 - Delete `~/.cubyz/ashframeCache/` anytime to force a full redownload.
 
 ## Install
@@ -22,4 +24,4 @@ exactly like stock Cubyz 0.4.1.
 ## Notes
 
 - Derived from Cubyz 0.4.1 (GPLv3, see LICENSE).
-- 6 changed files, marked `ASHFRAME CUSTOM CLIENT` in the source.
+- 8 changed files, marked `ASHFRAME CUSTOM CLIENT` in the source.

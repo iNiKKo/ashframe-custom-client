@@ -36,6 +36,10 @@ var storageLists: [settings.highestSupportedLod + 1]*[storageSize*storageSize*st
 var mapStorageLists: [settings.highestSupportedLod + 1]*[storageSize*storageSize]Atomic(?*LightMap.LightMapFragment) = undefined;
 var meshList: main.List(*chunk_meshing.ChunkMesh) = .empty;
 var priorityMeshUpdateList: main.utils.ConcurrentQueue(chunk.ChunkPosition) = undefined;
+// --- ASHFRAME CUSTOM CLIENT: meshes built before their lightmap fragment
+// arrived; retried whenever new fragments land. ---
+pub var sunRelightQueue: main.utils.ConcurrentQueue(chunk.ChunkPosition) = undefined;
+// --- ASHFRAME CUSTOM CLIENT ---
 pub var updatableList: main.List(chunk.ChunkPosition) = .empty;
 var mapUpdatableList: main.utils.ConcurrentQueue(*LightMap.LightMapFragment) = undefined;
 var lastPx: i32 = 0;
@@ -81,6 +85,9 @@ pub fn init() void { // MARK: init()
 		@memset(mapStorageList.*, .init(null));
 	}
 	priorityMeshUpdateList = .init(main.globalAllocator, 16);
+	// --- ASHFRAME CUSTOM CLIENT ---
+	sunRelightQueue = .init(main.globalAllocator, 16);
+	// --- ASHFRAME CUSTOM CLIENT ---
 	mapUpdatableList = .init(main.globalAllocator, 16);
 }
 
@@ -106,6 +113,9 @@ pub fn deinit() void {
 		map.deferredDeinit();
 	}
 	mapUpdatableList.deinit();
+	// --- ASHFRAME CUSTOM CLIENT ---
+	sunRelightQueue.deinit();
+	// --- ASHFRAME CUSTOM CLIENT ---
 	priorityMeshUpdateList.deinit();
 	meshList.clearAndFree(main.globalAllocator);
 	main.heap.GarbageCollection.waitForFreeCompletion();
@@ -754,6 +764,7 @@ pub fn updateMeshes(targetTime: std.Io.Timestamp) void { // MARK: updateMeshes()
 		mesh.uploadData();
 		if (targetTime.durationTo(main.timestamp()).nanoseconds >= 0) break; // Update at least one mesh.
 	}
+	var newMapsStored = false;
 	while (mapUpdatableList.popFront()) |map| {
 		if (!isMapInRenderDistance(map.pos)) {
 			map.deferredDeinit();
@@ -762,8 +773,32 @@ pub fn updateMeshes(targetTime: std.Io.Timestamp) void { // MARK: updateMeshes()
 			if (mapPointer) |old| {
 				old.deferredDeinit();
 			}
+			newMapsStored = true;
 		}
 	}
+	// --- ASHFRAME CUSTOM CLIENT: relight meshes that were built before
+	// their lightmap fragment arrived. Only attempted on frames where new
+	// fragments landed; failures requeue for the next arrival. Runs without
+	// the storage lock (relight takes mesh locks + pool tasks itself).
+	if (newMapsStored) {
+		var pending = main.ListManaged(chunk.ChunkPosition).init(main.stackAllocator);
+		defer pending.deinit();
+		while (sunRelightQueue.popFront()) |pos| {
+			pending.append(pos);
+		}
+		if (pending.items.len != 0) {
+			mutex.unlock();
+			defer mutex.lock();
+			for (pending.items) |pos| {
+				const mesh = getMesh(pos) orelse continue;
+				if (!mesh.sunLightMissing.load(.acquire)) continue;
+				if (!mesh.relightSun()) {
+					sunRelightQueue.pushBack(pos);
+				}
+			}
+		}
+	}
+	// --- ASHFRAME CUSTOM CLIENT ---
 	while (updatableList.items.len != 0) {
 		// TODO: Find a faster solution than going through the entire list every frame.
 		var closestPriority: f32 = -std.math.floatMax(f32);

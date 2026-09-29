@@ -148,6 +148,10 @@ pub const handShake = struct { // MARK: handShake
 
 	pub fn waitForAssetUnpack() !void {
 		while (!assetsUnpackDone.load(.acquire)) {
+			// --- ASHFRAME CUSTOM CLIENT: keep GC cycles running so a long
+			// join never trips the 20 s sync-point watchdog. ---
+			main.heap.GarbageCollection.syncPoint();
+			// --- ASHFRAME CUSTOM CLIENT ---
 			main.io.sleep(.fromMilliseconds(5), .awake) catch {};
 		}
 		if (assetsUnpackFailed.load(.acquire)) return error.AssetUnpackFailed;
