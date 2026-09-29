@@ -778,24 +778,23 @@ pub fn updateMeshes(targetTime: std.Io.Timestamp) void { // MARK: updateMeshes()
 	}
 	// --- ASHFRAME CUSTOM CLIENT: relight meshes that were built before
 	// their lightmap fragment arrived. Only attempted on frames where new
-	// fragments landed; failures requeue for the next arrival. Runs without
-	// the storage lock (relight takes mesh locks + pool tasks itself).
+	// fragments landed. Scheduling is cheap (a pool task each); the heavy
+	// relight runs on workers, so the render thread never stalls here.
+	// Capped per frame; the rest (plus failures) stay queued. Meshes outside
+	// render distance are skipped until approached.
+	const maxSunRelightsPerFrame: u32 = 256;
 	if (newMapsStored) {
-		var pending = main.ListManaged(chunk.ChunkPosition).init(main.stackAllocator);
-		defer pending.deinit();
-		while (sunRelightQueue.popFront()) |pos| {
-			pending.append(pos);
-		}
-		if (pending.items.len != 0) {
-			mutex.unlock();
-			defer mutex.lock();
-			for (pending.items) |pos| {
-				const mesh = getMesh(pos) orelse continue;
-				if (!mesh.sunLightMissing.load(.acquire)) continue;
-				if (!mesh.relightSun()) {
-					sunRelightQueue.pushBack(pos);
-				}
+		var checked: u32 = 0;
+		while (checked < maxSunRelightsPerFrame) {
+			const pos = sunRelightQueue.popFront() orelse break;
+			checked += 1;
+			const mesh = getMesh(pos) orelse continue;
+			if (!mesh.sunLightMissing.load(.acquire)) continue;
+			if (!isInRenderDistance(pos)) {
+				sunRelightQueue.pushBack(pos);
+				continue;
 			}
+			ChunkMesh.scheduleSunRelight(pos);
 		}
 	}
 	// --- ASHFRAME CUSTOM CLIENT ---

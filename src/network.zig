@@ -1960,6 +1960,9 @@ pub const Connection = struct { // MARK: Connection
 		if (self.user) |user| {
 			main.server.disconnect(user);
 		} else {
+			// --- ASHFRAME CUSTOM CLIENT: flush staged cache, end session. ---
+			main.ashframe_client.sessionEnd();
+			// --- ASHFRAME CUSTOM CLIENT ---
 			self.handShakeWaiting.broadcast();
 			if (self.handShakeState.load(.monotonic) == .complete) {
 				main.exitToMenu();

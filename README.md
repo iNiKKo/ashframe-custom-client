@@ -19,7 +19,8 @@ exactly like stock Cubyz 0.4.1.
 3. Build normally.
 4. Optional `launchConfig.zon` settings (defaults work out of the box):
    `.ashframeCache = true`, `.ashframeServer = "cubyz.ashframe.net"`,
-   `.ashframeCacheTTLHours = 24`.
+   `.ashframeCacheTTLHours = 24`, `.ashframeFlushMaxMB = 124`,
+   `.ashframeFlushIntervalMinutes = 5`, `.ashframeCacheMaxMB = 1024`.
 
 ## Notes
 

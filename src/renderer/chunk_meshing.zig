@@ -1375,6 +1375,58 @@ pub const ChunkMesh = struct { // MARK: ChunkMesh
 		}
 		LightRefreshTask.schedule(pos);
 	}
+
+	// --- ASHFRAME CUSTOM CLIENT: worker-side sun relight. ---
+	// Re-runs sun lighting for a mesh that was built before its lightmap
+	// fragment arrived, then regenerates + reuploads. Runs on the pool so a
+	// bulk arrival never stalls the render thread (the previous inline
+	// version froze the client right after connect). Propagation is
+	// max-based, so repeats are harmless.
+	pub fn scheduleSunRelight(pos: chunk.ChunkPosition) void {
+		const task = main.globalAllocator.create(SunRelightTask);
+		task.* = .{
+			.pos = pos,
+		};
+		main.threadPool.addTask(task, &SunRelightTask.vtable);
+	}
+	const SunRelightTask = struct {
+		pos: chunk.ChunkPosition,
+
+		pub const vtable = main.utils.ThreadPool.VTable{
+			.getPriority = main.meta.castFunctionSelfToAnyopaque(getPriority),
+			.isStillNeeded = main.meta.castFunctionSelfToAnyopaque(isStillNeeded),
+			.run = main.meta.castFunctionSelfToAnyopaque(run),
+			.clean = main.meta.castFunctionSelfToAnyopaque(clean),
+			.taskType = .misc,
+		};
+
+		pub fn schedule(pos: chunk.ChunkPosition) void {
+			ChunkMesh.scheduleSunRelight(pos);
+		}
+
+		pub fn getPriority(_: *SunRelightTask) f32 {
+			return 1000000;
+		}
+
+		pub fn isStillNeeded(_: *SunRelightTask) bool {
+			if (main.game.world == null or main.game.world.?.paused) return false;
+			return true;
+		}
+
+		pub fn run(self: *SunRelightTask) void {
+			defer main.globalAllocator.destroy(self);
+			const mesh = mesh_storage.getMesh(self.pos) orelse return;
+			if (!mesh.sunLightMissing.load(.acquire)) return;
+			if (!mesh.relightSun()) {
+				mesh_storage.sunRelightQueue.pushBack(self.pos);
+			}
+		}
+
+		pub fn clean(self: *SunRelightTask) void {
+			main.globalAllocator.destroy(self);
+		}
+	};
+	// --- ASHFRAME CUSTOM CLIENT ---
 	const LightRefreshTask = struct {
 		pos: chunk.ChunkPosition,
 

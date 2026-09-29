@@ -28,15 +28,32 @@ pub fn timingMark(stage: []const u8) void {
 }
 
 /// Remembers the typed server address. Called from the connecting window.
+/// Flushes first: any still-staged blobs belong to the previous session.
 pub fn noteDialAddress(ip: []const u8) void {
+	flushRam(true);
 	if (dialAddress) |old| main.globalAllocator.free(old);
 	dialAddress = main.globalAllocator.dupe(u8, ip);
 	timingReset();
 }
 
-/// Master toggle on, and dialed address matches the Ashframe server.
+/// Live multiplayer session on the dialed server. Set on connect, cleared
+/// on disconnect; keeps stale dial state from serving singleplayer.
+pub var sessionLive: std.atomic.Value(bool) = .init(false);
+
+pub fn sessionStart() void {
+	lastFlushMs = main.timestamp().toMilliseconds();
+	sessionLive.store(true, .release);
+}
+
+pub fn sessionEnd() void {
+	flushRam(true);
+	sessionLive.store(false, .release);
+}
+
+/// Master toggle on, live session, and dialed address matches Ashframe.
 pub fn isActive() bool {
 	if (!main.settings.launchConfig.ashframeCache) return false;
+	if (!sessionLive.load(.acquire)) return false;
 	const dial = dialAddress orelse return false;
 	const want = main.settings.launchConfig.ashframeServer;
 	if (want.len == 0) return false;
@@ -141,6 +158,7 @@ pub fn checkAssetPack(packData: []const u8) PackStatus {
 	if (readMetaTs(dir)) |ts| {
 		if (ttlMs > 0 and nowMs -% ts > ttlMs) {
 			std.log.info("Ashframe cache: expired (older than {d}h), flushing.", .{main.settings.launchConfig.ashframeCacheTTLHours});
+			ramClear();
 			cubyz.deleteTree(dirPath) catch {};
 			cubyz.makePath(dirPath) catch return .off;
 			var fresh = cubyz.openDir(dirPath) catch return .off;
@@ -151,6 +169,7 @@ pub fn checkAssetPack(packData: []const u8) PackStatus {
 	}
 	if (clientVersionMismatch(dir)) {
 		std.log.info("Ashframe cache: client version changed, flushing chunk cache.", .{});
+		ramClear();
 		cubyz.deleteTree(dirPath) catch {};
 		cubyz.makePath(dirPath) catch return .off;
 		var fresh = cubyz.openDir(dirPath) catch return .off;
@@ -165,6 +184,7 @@ pub fn checkAssetPack(packData: []const u8) PackStatus {
 		if (old != null and old.? == @as(i64, @bitCast(h))) return .unchanged;
 	}
 	std.log.info("Ashframe cache: asset pack changed, flushing chunk cache.", .{});
+	ramClear();
 	cubyz.deleteTree(dirPath) catch {};
 	cubyz.makePath(dirPath) catch return .off;
 	var fresh = cubyz.openDir(dirPath) catch return .off;
@@ -199,8 +219,10 @@ fn writeAtomic(dir: main.files.Dir, name: []const u8, data: []const u8) !void {
 	try dir.dir.rename(tmp, dir.dir, name, main.io);
 }
 
-/// Disk budget (~a few hundred MB). Random eviction down to 4/5 of cap.
-const maxCachedFiles: usize = 50000;
+/// On-disk per-server budget (bytes). Random eviction down to 4/5 of cap.
+fn cacheMaxBytes() usize {
+	return @as(usize, main.settings.launchConfig.ashframeCacheMaxMB)*1024*1024;
+}
 
 threadlocal var sweepCounter: u32 = 0;
 
@@ -210,78 +232,184 @@ fn maybeSweep(dirPath: []const u8) void {
 	const cubyz = main.files.cubyzDir();
 	var dir = cubyz.openDir(dirPath) catch return;
 	defer dir.close();
-	var names: main.ListManaged([]const u8) = .init(main.globalAllocator);
+	const Entry = struct { name: []u8, size: u64 };
+	var entries: main.ListManaged(Entry) = .init(main.globalAllocator);
 	defer {
-		for (names.items) |n| main.globalAllocator.free(n);
-		names.deinit();
+		for (entries.items) |e| main.globalAllocator.free(e.name);
+		entries.deinit();
 	}
+	var total: u64 = 0;
 	var it = dir.iterate();
 	while (true) {
 		const entry = (it.next(main.io) catch break) orelse break;
 		if (entry.kind != .file) continue;
 		if (!std.mem.endsWith(u8, entry.name, ".bin")) continue;
-		names.append(main.globalAllocator.dupe(u8, entry.name));
+		const st = dir.dir.statFile(main.io, entry.name, .{}) catch continue;
+		const name = main.globalAllocator.dupe(u8, entry.name);
+		entries.append(.{ .name = name, .size = st.size });
+		total += st.size;
 	}
-	if (names.items.len <= maxCachedFiles) return;
+	const cap = cacheMaxBytes();
+	if (total <= cap) return;
 	var rng: u64 = @as(u64, @intCast(main.timestamp().toNanoseconds())) | 0x9e3779b97f4a7c15;
-	const target = maxCachedFiles*4/5;
-	var i: usize = names.items.len;
-	while (i > target) {
+	var over: u64 = total - cap*4/5;
+	var i: usize = entries.items.len;
+	while (i > 0 and over > 0) {
 		rng ^= rng << 13;
 		rng ^= rng >> 7;
 		rng ^= rng << 17;
 		const victim = rng % i;
 		i -= 1;
-		const tmp = names.items[victim];
-		names.items[victim] = names.items[i];
-		names.items[i] = tmp;
-		dir.deleteFile(tmp) catch {};
+		const tmp = entries.items[victim];
+		entries.items[victim] = entries.items[i];
+		entries.items[i] = tmp;
+		over -= @min(over, tmp.size);
+		dir.deleteFile(tmp.name) catch {};
 	}
 }
 
-var storeErrCount: u32 = 0;
+// --- ASHFRAME CUSTOM CLIENT: RAM write buffer. ---
+// Received blobs stage here instead of hitting disk per chunk (thousands of
+// temp+rename cycles per join otherwise). Flushed to disk at
+// ashframeFlushMaxMB or every ashframeFlushIntervalMinutes, plus on
+// (re)connect and disconnect. Crash/kill loses at most one interval, which
+// just re-downloads; only complete flushes ever reach disk, so the on-disk
+// cache is never torn.
+var ramMap: std.StringHashMapUnmanaged([]u8) = .empty;
+var ramBytes: usize = 0;
+var ramMutex: main.utils.Mutex = .{};
+var lastFlushMs: i64 = 0;
 
-/// Stores a received chunk blob. Failures log throttled, then give up.
-pub fn storeChunk(pos: main.chunk.ChunkPosition, data: []const u8) void {
-	if (!isActive()) return;
+fn flushMaxBytes() usize {
+	return @as(usize, main.settings.launchConfig.ashframeFlushMaxMB)*1024*1024;
+}
+
+fn flushIntervalMs() i64 {
+	return @as(i64, @intCast(main.settings.launchConfig.ashframeFlushIntervalMinutes))*60*1000;
+}
+
+fn ramPut(name: []const u8, data: []const u8) void {
+	ramMutex.lock();
+	defer ramMutex.unlock();
+	const gpa = main.globalAllocator;
+	if (ramMap.getPtr(name)) |slot| {
+		ramBytes -= slot.*.len;
+		gpa.free(slot.*);
+		slot.* = gpa.dupe(u8, data);
+		ramBytes += slot.*.len;
+	} else {
+		const key = gpa.dupe(u8, name);
+		const val = gpa.dupe(u8, data);
+		ramMap.put(gpa.allocator, key, val) catch {
+			gpa.free(key);
+			gpa.free(val);
+			return;
+		};
+		ramBytes += val.len;
+	}
+}
+
+fn ramGet(name: []const u8) ?[]u8 {
+	ramMutex.lock();
+	defer ramMutex.unlock();
+	const blob = ramMap.get(name) orelse return null;
+	return main.globalAllocator.dupe(u8, blob);
+}
+
+fn ramRemove(name: []const u8) void {
+	ramMutex.lock();
+	defer ramMutex.unlock();
+	const kv = ramMap.fetchRemove(name) orelse return;
+	ramBytes -= kv.value.len;
+	main.globalAllocator.free(kv.key);
+	main.globalAllocator.free(kv.value);
+}
+
+pub fn ramClear() void {
+	ramMutex.lock();
+	defer ramMutex.unlock();
+	var it = ramMap.iterator();
+	while (it.next()) |kv| {
+		main.globalAllocator.free(kv.key_ptr.*);
+		main.globalAllocator.free(kv.value_ptr.*);
+	}
+	ramMap.clearRetainingCapacity();
+	ramBytes = 0;
+}
+
+/// Writes everything staged to disk (dir of the session that buffered it;
+/// callers order this before any dial-address switch). No-op when empty.
+pub fn flushRam(force: bool) void {
+	const nowMs = main.timestamp().toMilliseconds();
+	ramMutex.lock();
+	if (ramMap.count() == 0) {
+		ramMutex.unlock();
+		return;
+	}
+	const interval = flushIntervalMs();
+	if (!force and ramBytes < flushMaxBytes() and (interval <= 0 or nowMs -% lastFlushMs < interval)) {
+		ramMutex.unlock();
+		return;
+	}
+	var batch = ramMap;
+	ramMap = .empty;
+	ramBytes = 0;
+	lastFlushMs = nowMs;
+	ramMutex.unlock();
+	defer batch.deinit(main.globalAllocator.allocator);
 	var dirBuf: [256]u8 = undefined;
 	const dirPath = cacheDir(&dirBuf);
 	const cubyz = main.files.cubyzDir();
-	cubyz.makePath(dirPath) catch |err| {
-		if (storeErrCount < 3) std.log.err("Ashframe cache: makePath {s}/{s}: {s}", .{ main.files.cubyzDirStr(), dirPath, @errorName(err) });
-		storeErrCount +|= 1;
-		return;
+	var flushIt = batch.iterator();
+	const dirOpt: ?main.files.Dir = blk: {
+		cubyz.makePath(dirPath) catch break :blk null;
+		break :blk cubyz.openDir(dirPath) catch null;
 	};
-	var dir = cubyz.openDir(dirPath) catch |err| {
-		if (storeErrCount < 3) std.log.err("Ashframe cache: openDir {s}: {s}", .{dirPath, @errorName(err)});
-		storeErrCount +|= 1;
-		return;
-	};
-	defer dir.close();
-	var nameBuf: [128]u8 = undefined;
-	const name = chunkFileName(pos, &nameBuf);
-	writeAtomic(dir, name, data) catch |err| {
-		if (storeErrCount < 3) std.log.err("Ashframe cache: store {s}/{s}: {s}", .{ dirPath, name, @errorName(err) });
-		storeErrCount +|= 1;
-		return;
-	};
-	maybeSweep(dirPath);
+	if (dirOpt) |dir| {
+		var d = dir;
+		defer d.close();
+		while (flushIt.next()) |kv| {
+			writeAtomic(d, kv.key_ptr.*, kv.value_ptr.*) catch |err| {
+				std.log.err("Ashframe cache: flush store {s}: {s}", .{ kv.key_ptr.*, @errorName(err) });
+			};
+			main.globalAllocator.free(kv.key_ptr.*);
+			main.globalAllocator.free(kv.value_ptr.*);
+		}
+		maybeSweep(dirPath);
+	} else {
+		std.log.err("Ashframe cache: flush failed, dropping {d} staged blobs (re-downloaded later)", .{batch.count()});
+		while (flushIt.next()) |kv| {
+			main.globalAllocator.free(kv.key_ptr.*);
+			main.globalAllocator.free(kv.value_ptr.*);
+		}
+	}
 }
 
-/// Loads a cached chunk blob, or null on miss. Caller owns the memory.
+/// Stages a received chunk blob in RAM; flushed by size/interval/disconnect.
+pub fn storeChunk(pos: main.chunk.ChunkPosition, data: []const u8) void {
+	if (!isActive()) return;
+	var nameBuf: [128]u8 = undefined;
+	const name = chunkFileName(pos, &nameBuf);
+	ramPut(name, data);
+	flushRam(false);
+}
+
+/// Loads a cached chunk blob (RAM first, then disk), or null on miss.
+/// Caller owns the memory.
 pub fn loadChunk(pos: main.chunk.ChunkPosition) ?[]u8 {
 	if (!isActive()) return null;
+	var nameBuf: [128]u8 = undefined;
+	const name = chunkFileName(pos, &nameBuf);
+	if (ramGet(name)) |blob| return blob;
 	var dirBuf: [256]u8 = undefined;
 	const dirPath = cacheDir(&dirBuf);
 	var dir = main.files.cubyzDir().openDir(dirPath) catch return null;
 	defer dir.close();
-	var nameBuf: [128]u8 = undefined;
-	const name = chunkFileName(pos, &nameBuf);
 	const data = dir.read(main.globalAllocator, name) catch return null;
 	return data;
 }
 
-/// Drops cached blobs for a live-edited block (all LODs + lightmap).
+/// Drops cached blobs for a live-edited block (RAM + disk, all LODs + lightmap).
 pub fn invalidateChunk(wx: i32, wy: i32, wz: i32) void {
 	if (!isActive()) return;
 	var dirBuf: [256]u8 = undefined;
@@ -298,6 +426,7 @@ pub fn invalidateChunk(wx: i32, wy: i32, wz: i32) void {
 			.wz = wz & ~mask,
 			.voxelSize = vs,
 		}, &nameBuf);
+		ramRemove(name);
 		dir.deleteFile(name) catch {};
 		invalidateLightMapIn(dir, wx, wy, vs);
 	}
@@ -307,30 +436,26 @@ fn lightMapFileName(wx: i32, wy: i32, vs: u31, buf: *[128]u8) []const u8 {
 	return std.fmt.bufPrint(buf, "m_{d}_{d}_{d}.bin", .{ wx, wy, vs }) catch "m_invalid.bin";
 }
 
-/// Stores a received lightmap fragment blob. Same contract as storeChunk.
+/// Stages a received lightmap fragment blob. Same contract as storeChunk.
 pub fn storeLightMap(wx: i32, wy: i32, vs: u31, data: []const u8) void {
 	if (!isActive()) return;
-	var dirBuf: [256]u8 = undefined;
-	const dirPath = cacheDir(&dirBuf);
-	const cubyz = main.files.cubyzDir();
-	cubyz.makePath(dirPath) catch return;
-	var dir = cubyz.openDir(dirPath) catch return;
-	defer dir.close();
 	var nameBuf: [128]u8 = undefined;
 	const name = lightMapFileName(wx, wy, vs, &nameBuf);
-	writeAtomic(dir, name, data) catch {};
-	maybeSweep(dirPath);
+	ramPut(name, data);
+	flushRam(false);
 }
 
-/// Loads a cached lightmap fragment, or null on miss. Caller owns the memory.
+/// Loads a cached lightmap fragment (RAM first, then disk), or null on miss.
+/// Caller owns the memory.
 pub fn loadLightMap(wx: i32, wy: i32, vs: u31) ?[]u8 {
 	if (!isActive()) return null;
+	var nameBuf: [128]u8 = undefined;
+	const name = lightMapFileName(wx, wy, vs, &nameBuf);
+	if (ramGet(name)) |blob| return blob;
 	var dirBuf: [256]u8 = undefined;
 	const dirPath = cacheDir(&dirBuf);
 	var dir = main.files.cubyzDir().openDir(dirPath) catch return null;
 	defer dir.close();
-	var nameBuf: [128]u8 = undefined;
-	const name = lightMapFileName(wx, wy, vs, &nameBuf);
 	const data = dir.read(main.globalAllocator, name) catch return null;
 	return data;
 }
@@ -341,6 +466,7 @@ fn invalidateLightMapIn(dir: main.files.Dir, x: i32, y: i32, vs: u31) void {
 	const mask: i32 = span - 1;
 	var nameBuf: [128]u8 = undefined;
 	const name = lightMapFileName(x & ~mask, y & ~mask, vs, &nameBuf);
+	ramRemove(name);
 	dir.deleteFile(name) catch {};
 }
 // --- ASHFRAME CUSTOM CLIENT ---
