@@ -70,6 +70,27 @@ pub fn packHash(data: []const u8) u64 {
 	return std.hash.Wyhash.hash(0, data);
 }
 
+/// Cached pack hash to announce at handshake, or null when there is nothing
+/// usable to announce (feature off, no cache, TTL expired, version changed).
+/// The server replies with an empty marker instead of the pack on a match;
+/// otherwise it sends the full pack exactly as before.
+pub fn announcedPackHash() ?u64 {
+	if (!isActive()) return null;
+	var dirBuf: [256]u8 = undefined;
+	const dirPath = cacheDir(&dirBuf);
+	var dir = main.files.cubyzDir().openDir(dirPath) catch return null;
+	defer dir.close();
+	const zon = dir.readToZon(main.stackAllocator, metaFile) catch return null;
+	defer zon.deinit(main.stackAllocator);
+	const oldVer = zon.get([]const u8, "clientVersion") orelse return null;
+	if (!std.mem.eql(u8, oldVer, main.settings.version.version)) return null;
+	const ts = zon.get(i64, "flushedAtMs") orelse return null;
+	const ttlMs: i64 = @as(i64, @intCast(main.settings.launchConfig.ashframeCacheTTLHours))*60*60*1000;
+	if (ttlMs > 0 and main.timestamp().toMilliseconds() -% ts > ttlMs) return null;
+	const h = zon.get(i64, "packHash") orelse return null;
+	return @bitCast(h);
+}
+
 const metaFile = "cache.zon";
 
 fn readMetaTs(dir: main.files.Dir) ?i64 {

@@ -182,8 +182,19 @@ pub const handShake = struct { // MARK: handShake
 					// --- ASHFRAME CUSTOM CLIENT: timing. ---
 					main.ashframe_client.timingMark("assets pack received");
 					// --- ASHFRAME CUSTOM CLIENT ---
-					// --- ASHFRAME CUSTOM CLIENT: skip unpack if pack unchanged. ---
-					if (main.ashframe_client.checkAssetPack(reader.remaining) == .unchanged) {
+					// --- ASHFRAME CUSTOM CLIENT: server-confirmed skip. ---
+					// Empty payload = the server confirms our announced hash:
+					// cache is current, nothing to unpack. Only ever sent in
+					// reply to an announcement, so vanilla flow is untouched.
+					if (reader.remaining.len == 0 and main.ashframe_client.isActive()) {
+						std.log.info("Ashframe client: server confirmed cached pack, skipping.", .{});
+						// --- ASHFRAME CUSTOM CLIENT: timing. ---
+						main.ashframe_client.timingMark("assets pack skipped (server-confirmed)");
+						// --- ASHFRAME CUSTOM CLIENT ---
+						assetsUnpackDone.store(true, .release);
+						assetsUnpackFailed.store(false, .release);
+					} else if (main.ashframe_client.checkAssetPack(reader.remaining) == .unchanged) {
+						// --- ASHFRAME CUSTOM CLIENT: skip unpack if pack unchanged. ---
 						std.log.info("Ashframe client: asset pack unchanged, keeping serverAssets.", .{});
 						// --- ASHFRAME CUSTOM CLIENT: timing. ---
 						main.ashframe_client.timingMark("assets unpack skipped (cached)");
@@ -343,6 +354,14 @@ pub const handShake = struct { // MARK: handShake
 				if (main.network.authentication.KeyCollection.initialized) {
 					zonObject.put("keys", main.network.authentication.KeyCollection.getPublicKeys(main.stackAllocator));
 				}
+				// --- ASHFRAME CUSTOM CLIENT: announce cached pack hash. ---
+				// Vanilla servers ignore unknown fields; active only on the
+				// Ashframe server. The server sends an empty marker instead
+				// of the pack when it matches, else the full pack as usual.
+				if (main.ashframe_client.announcedPackHash()) |h| {
+					zonObject.put("ashframePackHash", @as(i64, @bitCast(h)));
+				}
+				// --- ASHFRAME CUSTOM CLIENT ---
 				try conn.secureChannel.startTlsHandshake();
 				conn.secureChannel.finishedCollectingClientVerificationData = true;
 
