@@ -36,9 +36,18 @@ var storageLists: [settings.highestSupportedLod + 1]*[storageSize*storageSize*st
 var mapStorageLists: [settings.highestSupportedLod + 1]*[storageSize*storageSize]Atomic(?*LightMap.LightMapFragment) = undefined;
 var meshList: main.List(*chunk_meshing.ChunkMesh) = .empty;
 var priorityMeshUpdateList: main.utils.ConcurrentQueue(chunk.ChunkPosition) = undefined;
-// --- ASHFRAME CUSTOM CLIENT: meshes built before their lightmap fragment
-// arrived; retried whenever new fragments land. ---
-pub var sunRelightQueue: main.utils.ConcurrentQueue(chunk.ChunkPosition) = undefined;
+// --- ASHFRAME CUSTOM CLIENT: mesh builds deferred until their lightmap
+// fragment exists. Guarded by `mutex` (workers append, render thread scans).
+// See deferMeshForLightmap. ---
+const PendingLightMesh = struct {
+	pos: chunk.ChunkPosition,
+	data: []const u8,
+	atMs: i64,
+};
+var pendingLightMeshes: main.ListManaged(PendingLightMesh) = undefined;
+const maxPendingLightMeshes: usize = 512;
+const pendingLightMeshExpiryMs: i64 = 5000;
+var pendingLightScanMs: i64 = 0;
 // --- ASHFRAME CUSTOM CLIENT ---
 pub var updatableList: main.List(chunk.ChunkPosition) = .empty;
 var mapUpdatableList: main.utils.ConcurrentQueue(*LightMap.LightMapFragment) = undefined;
@@ -86,7 +95,7 @@ pub fn init() void { // MARK: init()
 	}
 	priorityMeshUpdateList = .init(main.globalAllocator, 16);
 	// --- ASHFRAME CUSTOM CLIENT ---
-	sunRelightQueue = .init(main.globalAllocator, 16);
+	pendingLightMeshes = .init(main.globalAllocator);
 	// --- ASHFRAME CUSTOM CLIENT ---
 	mapUpdatableList = .init(main.globalAllocator, 16);
 }
@@ -114,7 +123,10 @@ pub fn deinit() void {
 	}
 	mapUpdatableList.deinit();
 	// --- ASHFRAME CUSTOM CLIENT ---
-	sunRelightQueue.deinit();
+	for (pendingLightMeshes.items) |entry| {
+		main.globalAllocator.free(entry.data);
+	}
+	pendingLightMeshes.deinit();
 	// --- ASHFRAME CUSTOM CLIENT ---
 	priorityMeshUpdateList.deinit();
 	meshList.clearAndFree(main.globalAllocator);
@@ -776,25 +788,36 @@ pub fn updateMeshes(targetTime: std.Io.Timestamp) void { // MARK: updateMeshes()
 			newMapsStored = true;
 		}
 	}
-	// --- ASHFRAME CUSTOM CLIENT: relight meshes that were built before
-	// their lightmap fragment arrived. Only attempted on frames where new
-	// fragments landed. Scheduling is cheap (a pool task each); the heavy
-	// relight runs on workers, so the render thread never stalls here.
-	// Capped per frame; the rest (plus failures) stay queued. Meshes outside
-	// render distance are skipped until approached.
-	const maxSunRelightsPerFrame: u32 = 256;
-	if (newMapsStored) {
-		var checked: u32 = 0;
-		while (checked < maxSunRelightsPerFrame) {
-			const pos = sunRelightQueue.popFront() orelse break;
-			checked += 1;
-			const mesh = getMesh(pos) orelse continue;
-			if (!mesh.sunLightMissing.load(.acquire)) continue;
-			if (!isInRenderDistance(pos)) {
-				sunRelightQueue.pushBack(pos);
-				continue;
+	// --- ASHFRAME CUSTOM CLIENT: retry deferred mesh builds. Runs when new
+	// fragments landed (or ~1/s so expiry can't strand entries). Each entry
+	// either re-enters the stock pipeline as a fresh task, builds now if it
+	// waited too long, or is dropped when out of range. Only addTask calls
+	// happen under the lock; the heavy builds run on workers.
+	if (pendingLightMeshes.items.len != 0) {
+		const nowMs = main.timestamp().toMilliseconds();
+		if (newMapsStored or nowMs -% pendingLightScanMs >= 1000) {
+			pendingLightScanMs = nowMs;
+			var i: usize = pendingLightMeshes.items.len;
+			while (i > 0) {
+				i -= 1;
+				const entry = pendingLightMeshes.items[i];
+				const hasFragment = getLightMapPiece(entry.pos.wx, entry.pos.wy, entry.pos.voxelSize) != null;
+				const expired = nowMs -% entry.atMs >= pendingLightMeshExpiryMs;
+				const inRange = isInRenderDistance(entry.pos);
+				if (!inRange) {
+					main.globalAllocator.free(entry.data);
+					_ = pendingLightMeshes.swapRemove(i);
+				} else if (hasFragment or expired) {
+					const task = main.globalAllocator.create(network.protocols.chunkTransmission.MeshGenerationTask);
+					task.* = .{
+						.pos = entry.pos,
+						.data = entry.data,
+						.forceBuild = true,
+					};
+					main.threadPool.addTask(task, &network.protocols.chunkTransmission.MeshGenerationTask.vtable);
+					_ = pendingLightMeshes.swapRemove(i);
+				}
 			}
-			ChunkMesh.scheduleSunRelight(pos);
 		}
 	}
 	// --- ASHFRAME CUSTOM CLIENT ---
@@ -868,6 +891,26 @@ pub fn finishMesh(pos: chunk.ChunkPosition) void {
 	defer mutex.unlock();
 	updatableList.append(main.globalAllocator, pos);
 }
+
+// --- ASHFRAME CUSTOM CLIENT: defer mesh creation until the lightmap
+// fragment exists, so meshes are never born dark. Called from mesh-build
+// worker threads; takes ownership of `data` on true. Returns false when
+// the pending list is full (caller falls back to the stock path).
+// The scan in updateMeshes retries entries once their fragment lands;
+// entries that outlive the wait (expiry) or leave render distance are
+// built/dropped there, so nothing stalls forever and nothing leaks.
+pub fn deferMeshForLightmap(pos: chunk.ChunkPosition, data: []const u8) bool {
+	mutex.lock();
+	defer mutex.unlock();
+	if (pendingLightMeshes.items.len >= maxPendingLightMeshes) return false;
+	pendingLightMeshes.append(.{
+		.pos = pos,
+		.data = data,
+		.atMs = main.timestamp().toMilliseconds(),
+	});
+	return true;
+}
+// --- ASHFRAME CUSTOM CLIENT ---
 
 // MARK: updaters
 

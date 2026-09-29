@@ -9,7 +9,8 @@ exactly like stock Cubyz 0.4.1.
 - Saves downloaded chunks and lighting to disk, reuses them on revisit.
   Writes are batched in RAM and flushed periodically, not on every chunk.
 - Edited areas re-download automatically. Old data expires on its own.
-- Meshes built before their light data arrives are re-lit automatically.
+- Chunk meshes wait for their light data before building, so lighting is
+  correct on arrival instead of dark-until-revisit.
 - Faster handshake ramp on high-latency links (send pacing only).
 - Delete `~/.cubyz/ashframeCache/` anytime to force a full redownload.
 

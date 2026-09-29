@@ -491,10 +491,6 @@ pub const ChunkMesh = struct { // MARK: ChunkMesh
 	lastTransparentUpdatePos: Vec3i = Vec3i{0, 0, 0},
 
 	needsLightRefresh: std.atomic.Value(bool) = .init(false),
-	// --- ASHFRAME CUSTOM CLIENT: set when the mesh was lit without its
-	// lightmap fragment (fragment arrived late). Cleared once relit. ---
-	sunLightMissing: std.atomic.Value(bool) = .init(false),
-	// --- ASHFRAME CUSTOM CLIENT ---
 	needsMeshUpdate: bool = false,
 	finishedMeshing: bool = false, // Must be synced with node.finishedMeshing in mesh_storage.zig
 	finishedLighting: bool = false,
@@ -570,25 +566,11 @@ pub const ChunkMesh = struct { // MARK: ChunkMesh
 		}
 		self.mutex.unlock();
 		self.lightingData[0].propagateLights(lightEmittingBlocks.items, true, lightRefreshList);
-		if (!self.initSunLight(lightRefreshList)) {
-			// --- ASHFRAME CUSTOM CLIENT: fragment not here yet; the mesh
-			// goes out dark and is relit when the fragment arrives (see
-			// relightSun + mesh_storage sunRelightQueue). ---
-			self.sunLightMissing.store(true, .release);
-			mesh_storage.sunRelightQueue.pushBack(self.pos);
-		}
-	}
-
-	// --- ASHFRAME CUSTOM CLIENT: sun-only lighting, factored out of
-	// initLight so a mesh built without its lightmap fragment can be relit
-	// later. Propagation is max-based (idempotent): re-running only raises
-	// values, never double-applies. Returns false when no fragment exists.
-	pub fn initSunLight(self: *ChunkMesh, lightRefreshList: *main.ListManaged(chunk.ChunkPosition)) bool {
-		{
+		sunLight: {
 			var allSun: bool = self.chunk.data.palette().len == 1 and self.chunk.data.palette()[0].load(.unordered).typ == 0;
 			var sunStarters: [chunk.chunkSize*chunk.chunkSize]chunk.BlockPos = undefined;
 			var index: usize = 0;
-			const lightStartMap = mesh_storage.getLightMapPiece(self.pos.wx, self.pos.wy, self.pos.voxelSize) orelse return false;
+			const lightStartMap = mesh_storage.getLightMapPiece(self.pos.wx, self.pos.wy, self.pos.voxelSize) orelse break :sunLight;
 			var x: u8 = 0;
 			while (x < chunk.chunkSize) : (x += 1) {
 				var y: u8 = 0;
@@ -610,26 +592,6 @@ pub const ChunkMesh = struct { // MARK: ChunkMesh
 				self.lightingData[1].propagateLights(sunStarters[0..index], true, lightRefreshList);
 			}
 		}
-		return true;
-	}
-
-	// --- ASHFRAME CUSTOM CLIENT: re-run sun lighting for a mesh that was
-	// built before its lightmap fragment arrived, then regenerate + reupload.
-	// Returns false (flag kept) when the fragment is still missing.
-	pub fn relightSun(self: *ChunkMesh) bool {
-		var lightRefreshList = main.ListManaged(chunk.ChunkPosition).init(main.stackAllocator);
-		defer lightRefreshList.deinit();
-		if (!self.initSunLight(&lightRefreshList)) return false;
-		self.sunLightMissing.store(false, .release);
-		self.generateMesh(&lightRefreshList);
-		for (lightRefreshList.items) |pos| {
-			ChunkMesh.scheduleLightRefresh(pos);
-		}
-		self.mutex.lock();
-		defer self.mutex.unlock();
-		self.finishData();
-		mesh_storage.addToUpdateList(self);
-		return true;
 	}
 
 	pub fn generateLightingData(self: *ChunkMesh) error{ AlreadyStored, NoLongerNeeded }!void {
@@ -1376,57 +1338,6 @@ pub const ChunkMesh = struct { // MARK: ChunkMesh
 		LightRefreshTask.schedule(pos);
 	}
 
-	// --- ASHFRAME CUSTOM CLIENT: worker-side sun relight. ---
-	// Re-runs sun lighting for a mesh that was built before its lightmap
-	// fragment arrived, then regenerates + reuploads. Runs on the pool so a
-	// bulk arrival never stalls the render thread (the previous inline
-	// version froze the client right after connect). Propagation is
-	// max-based, so repeats are harmless.
-	pub fn scheduleSunRelight(pos: chunk.ChunkPosition) void {
-		const task = main.globalAllocator.create(SunRelightTask);
-		task.* = .{
-			.pos = pos,
-		};
-		main.threadPool.addTask(task, &SunRelightTask.vtable);
-	}
-	const SunRelightTask = struct {
-		pos: chunk.ChunkPosition,
-
-		pub const vtable = main.utils.ThreadPool.VTable{
-			.getPriority = main.meta.castFunctionSelfToAnyopaque(getPriority),
-			.isStillNeeded = main.meta.castFunctionSelfToAnyopaque(isStillNeeded),
-			.run = main.meta.castFunctionSelfToAnyopaque(run),
-			.clean = main.meta.castFunctionSelfToAnyopaque(clean),
-			.taskType = .misc,
-		};
-
-		pub fn schedule(pos: chunk.ChunkPosition) void {
-			ChunkMesh.scheduleSunRelight(pos);
-		}
-
-		pub fn getPriority(_: *SunRelightTask) f32 {
-			return 1000000;
-		}
-
-		pub fn isStillNeeded(_: *SunRelightTask) bool {
-			if (main.game.world == null or main.game.world.?.paused) return false;
-			return true;
-		}
-
-		pub fn run(self: *SunRelightTask) void {
-			defer main.globalAllocator.destroy(self);
-			const mesh = mesh_storage.getMesh(self.pos) orelse return;
-			if (!mesh.sunLightMissing.load(.acquire)) return;
-			if (!mesh.relightSun()) {
-				mesh_storage.sunRelightQueue.pushBack(self.pos);
-			}
-		}
-
-		pub fn clean(self: *SunRelightTask) void {
-			main.globalAllocator.destroy(self);
-		}
-	};
-	// --- ASHFRAME CUSTOM CLIENT ---
 	const LightRefreshTask = struct {
 		pos: chunk.ChunkPosition,
 

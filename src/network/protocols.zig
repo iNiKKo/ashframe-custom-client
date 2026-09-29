@@ -457,6 +457,10 @@ pub const chunkTransmission = struct { // MARK: chunkTransmission
 	pub const MeshGenerationTask = struct {
 		pos: chunk.ChunkPosition,
 		data: []const u8,
+		// --- ASHFRAME CUSTOM CLIENT: skip the lightmap deferral (used for
+		// entries that already waited it out). ---
+		forceBuild: bool = false,
+		// --- ASHFRAME CUSTOM CLIENT ---
 
 		pub const vtable = utils.ThreadPool.VTable{
 			.getPriority = main.meta.castFunctionSelfToAnyopaque(getPriority),
@@ -479,10 +483,23 @@ pub const chunkTransmission = struct { // MARK: chunkTransmission
 		}
 
 		pub fn run(self: *MeshGenerationTask) void {
-			defer self.clean();
 			// --- ASHFRAME CUSTOM CLIENT: cache the blob (worker thread). ---
 			main.ashframe_client.storeChunk(self.pos, self.data);
 			// --- ASHFRAME CUSTOM CLIENT ---
+			// --- ASHFRAME CUSTOM CLIENT: defer the build until the lightmap
+			// fragment exists, so meshes are never born dark. Deferred data
+			// is owned by mesh_storage.pendingLightMeshes; retries re-enter
+			// here as fresh tasks through the stock path below. ---
+			if (!self.forceBuild) {
+				if (renderer.mesh_storage.getLightMapPiece(self.pos.wx, self.pos.wy, self.pos.voxelSize) == null) {
+					if (renderer.mesh_storage.deferMeshForLightmap(self.pos, self.data)) {
+						main.globalAllocator.destroy(self);
+						return;
+					}
+				}
+			}
+			// --- ASHFRAME CUSTOM CLIENT ---
+			defer self.clean();
 			const pos = self.pos;
 			const mesh = main.renderer.chunk_meshing.ChunkMesh.init(pos, self.data) catch |err| {
 				std.log.err("Could not load chunk mesh from server: {s} Disconnecting.", .{@errorName(err)});
