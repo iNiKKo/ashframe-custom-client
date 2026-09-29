@@ -135,9 +135,7 @@ pub const handShake = struct { // MARK: handShake
 			};
 			main.ashframe_client.noteAssetsUnpacked(self.data);
 			assetsUnpackDone.store(true, .release);
-			// --- ASHFRAME CUSTOM CLIENT: timing. ---
-			main.ashframe_client.timingMark("assets unpack done");
-			// --- ASHFRAME CUSTOM CLIENT ---
+			main.ashframe_client.timingMark("assets unpack done"); // ASHFRAME: timing
 		}
 
 		pub fn clean(self: *AssetUnpackTask) void {
@@ -183,26 +181,18 @@ pub const handShake = struct { // MARK: handShake
 				},
 				.assets => {
 					std.log.info("Received assets.", .{});
-					// --- ASHFRAME CUSTOM CLIENT: timing. ---
-					main.ashframe_client.timingMark("assets pack received");
-					// --- ASHFRAME CUSTOM CLIENT ---
-					// --- ASHFRAME CUSTOM CLIENT: server-confirmed skip. ---
-					// Empty payload = the server confirms our announced hash:
-					// cache is current, nothing to unpack. Only ever sent in
-					// reply to an announcement, so vanilla flow is untouched.
+					main.ashframe_client.timingMark("assets pack received"); // ASHFRAME: timing
+					// --- ASHFRAME CUSTOM CLIENT: server-confirmed skip (empty
+					// payload answers our hash announcement; vanilla untouched). ---
 					if (reader.remaining.len == 0 and main.ashframe_client.isActive()) {
 						main.ashframe_client.infoLog("client: server confirmed cached pack, skipping.", .{});
-						// --- ASHFRAME CUSTOM CLIENT: timing. ---
-						main.ashframe_client.timingMark("assets pack skipped (server-confirmed)");
-						// --- ASHFRAME CUSTOM CLIENT ---
+						main.ashframe_client.timingMark("assets pack skipped (server-confirmed)"); // ASHFRAME: timing
 						assetsUnpackDone.store(true, .release);
 						assetsUnpackFailed.store(false, .release);
 					} else if (main.ashframe_client.checkAssetPack(reader.remaining) == .unchanged) {
 						// --- ASHFRAME CUSTOM CLIENT: skip unpack if pack unchanged. ---
 						main.ashframe_client.infoLog("client: asset pack unchanged, keeping serverAssets.", .{});
-						// --- ASHFRAME CUSTOM CLIENT: timing. ---
-						main.ashframe_client.timingMark("assets unpack skipped (cached)");
-						// --- ASHFRAME CUSTOM CLIENT ---
+						main.ashframe_client.timingMark("assets unpack skipped (cached)"); // ASHFRAME: timing
 						assetsUnpackDone.store(true, .release);
 						assetsUnpackFailed.store(false, .release);
 					} else {
@@ -216,16 +206,12 @@ pub const handShake = struct { // MARK: handShake
 						main.threadPool.addTask(task, &AssetUnpackTask.vtable);
 						// noteAssetsUnpacked runs after the background unpack
 						// finishes; finishHandshake waits for it (see below).
-						// --- ASHFRAME CUSTOM CLIENT: timing. ---
-						main.ashframe_client.timingMark("assets unpack dispatched");
-						// --- ASHFRAME CUSTOM CLIENT ---
+						main.ashframe_client.timingMark("assets unpack dispatched"); // ASHFRAME: timing
 					}
 					// --- ASHFRAME CUSTOM CLIENT ---
 				},
 				.serverData => {
-					// --- ASHFRAME CUSTOM CLIENT: timing. ---
-					main.ashframe_client.timingMark("serverData received");
-					// --- ASHFRAME CUSTOM CLIENT ---
+					main.ashframe_client.timingMark("serverData received"); // ASHFRAME: timing
 					handshakeZon = ZonElement.parseFromString(main.stackAllocator, null, reader.remaining);
 					defer handshakeZon.deinit(main.stackAllocator);
 					conn.handShakeState.store(.complete, .monotonic);
@@ -374,9 +360,7 @@ pub const handShake = struct { // MARK: handShake
 				defer main.stackAllocator.free(data);
 
 				conn.send(.secure, id, data);
-				// --- ASHFRAME CUSTOM CLIENT: timing. ---
-				main.ashframe_client.timingMark("handshake/userData sent");
-				// --- ASHFRAME CUSTOM CLIENT ---
+				main.ashframe_client.timingMark("handshake/userData sent"); // ASHFRAME: timing
 			},
 			.reload => {
 				conn.send(.secure, id, &.{@intFromEnum(Connection.HandShakeState.reload)});
@@ -766,7 +750,12 @@ pub const genericUpdate = struct { // MARK: genericUpdate
 				main.sync.setGamemode(null, try reader.readEnum(main.game.Gamemode));
 			},
 			.teleport => {
-				game.Player.setPosBlocking(try reader.readVec(Vec3d));
+				const pos = try reader.readVec(Vec3d);
+				game.Player.setPosBlocking(pos);
+				// --- ASHFRAME CUSTOM CLIENT: first teleport of a session
+				// carries the spawn — kick the connect prefetch once. ---
+				main.ashframe_client.noteTeleport(@as(i32, @intFromFloat(pos[0])), @as(i32, @intFromFloat(pos[1])), @as(i32, @intFromFloat(pos[2])));
+				// --- ASHFRAME CUSTOM CLIENT ---
 			},
 			.worldEditPos => {
 				const typ = try reader.readEnum(WorldEditPosition);
@@ -786,6 +775,9 @@ pub const genericUpdate = struct { // MARK: genericUpdate
 			.time => {
 				const world = conn.manager.world.?;
 				const expectedTime = try reader.readInt(i64);
+				// --- ASHFRAME CUSTOM CLIENT: clock synced (reveal gate). ---
+				main.ashframe_client.noteTimeSynced();
+				// --- ASHFRAME CUSTOM CLIENT ---
 
 				var curTime = world.gameTime.load(.monotonic);
 				if (@abs(curTime -% expectedTime) >= 10) {

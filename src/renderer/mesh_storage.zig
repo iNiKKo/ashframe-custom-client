@@ -43,7 +43,14 @@ const PendingLightMesh = struct {
 	pos: chunk.ChunkPosition,
 	data: []const u8,
 	atMs: i64,
+	retries: u8 = 0,
 };
+/// Expiry re-stamps instead of dark-building (the serve path re-requests
+/// the still-missing fragment every frame). After this many expiries the
+/// fragment is assumed lost and the mesh builds anyway — a hole (which
+/// the client never retries) is worse than a dark mesh (which relights
+/// on arrival via relightMeshesForFragment below).
+const maxPendingLightRetries: u8 = 3;
 var pendingLightMeshes: main.ListManaged(PendingLightMesh) = undefined;
 const maxPendingLightMeshes: usize = 512;
 const pendingLightMeshExpiryMs: i64 = 5000;
@@ -94,9 +101,7 @@ pub fn init() void { // MARK: init()
 		@memset(mapStorageList.*, .init(null));
 	}
 	priorityMeshUpdateList = .init(main.globalAllocator, 16);
-	// --- ASHFRAME CUSTOM CLIENT ---
-	pendingLightMeshes = .init(main.globalAllocator);
-	// --- ASHFRAME CUSTOM CLIENT ---
+	pendingLightMeshes = .init(main.globalAllocator); // ASHFRAME: deferred builds
 	mapUpdatableList = .init(main.globalAllocator, 16);
 }
 
@@ -122,12 +127,10 @@ pub fn deinit() void {
 		map.deferredDeinit();
 	}
 	mapUpdatableList.deinit();
-	// --- ASHFRAME CUSTOM CLIENT ---
-	for (pendingLightMeshes.items) |entry| {
+	for (pendingLightMeshes.items) |entry| { // ASHFRAME: free deferred blobs
 		main.globalAllocator.free(entry.data);
 	}
 	pendingLightMeshes.deinit();
-	// --- ASHFRAME CUSTOM CLIENT ---
 	priorityMeshUpdateList.deinit();
 	meshList.clearAndFree(main.globalAllocator);
 	main.heap.GarbageCollection.waitForFreeCompletion();
@@ -599,6 +602,8 @@ pub noinline fn updateAndGetRenderChunks(conn: *network.Connection, frustum: *co
 	mutex.unlock();
 	freeOldMeshes(olderPx, olderPy, olderPz, olderRD);
 
+	// --- ASHFRAME CUSTOM CLIENT: one dir handle + timing for the serve pass. ---
+	main.ashframe_client.beginServeBatch();
 	createNewMeshes(olderPx, olderPy, olderPz, olderRD, &meshRequests, &mapRequests);
 
 	// --- ASHFRAME CUSTOM CLIENT: serve lightmaps from disk if cached. ---
@@ -622,6 +627,7 @@ pub noinline fn updateAndGetRenderChunks(conn: *network.Connection, frustum: *co
 		mapRequests.items.len = kept;
 	}
 	// --- ASHFRAME CUSTOM CLIENT ---
+	main.ashframe_client.endServeBatch();
 
 	// Make requests as soon as possible to reduce latency:
 	network.protocols.lightMapRequest.sendRequest(conn, mapRequests.items);
@@ -786,6 +792,10 @@ pub fn updateMeshes(targetTime: std.Io.Timestamp) void { // MARK: updateMeshes()
 				old.deferredDeinit();
 			}
 			newMapsStored = true;
+			// --- ASHFRAME CUSTOM CLIENT: a mesh built before its fragment
+			// arrived stays dark otherwise (nothing re-lights built meshes).
+			// Refresh the covered meshes so they pick up real light now. ---
+			relightMeshesForFragment(map.pos.wx, map.pos.wy, map.pos.voxelSize);
 		}
 	}
 	// --- ASHFRAME CUSTOM CLIENT: retry deferred mesh builds. Runs when new
@@ -807,7 +817,7 @@ pub fn updateMeshes(targetTime: std.Io.Timestamp) void { // MARK: updateMeshes()
 				if (!inRange) {
 					main.globalAllocator.free(entry.data);
 					_ = pendingLightMeshes.swapRemove(i);
-				} else if (hasFragment or expired) {
+				} else if (hasFragment) {
 					const task = main.globalAllocator.create(network.protocols.chunkTransmission.MeshGenerationTask);
 					task.* = .{
 						.pos = entry.pos,
@@ -816,6 +826,24 @@ pub fn updateMeshes(targetTime: std.Io.Timestamp) void { // MARK: updateMeshes()
 					};
 					main.threadPool.addTask(task, &network.protocols.chunkTransmission.MeshGenerationTask.vtable);
 					_ = pendingLightMeshes.swapRemove(i);
+				} else if (expired) {
+					// --- ASHFRAME CUSTOM CLIENT: never build dark. Re-stamp
+					// so the serve path re-requests the fragment; only after
+					// maxPendingLightRetries expiries assume it lost and
+					// build anyway (a hole never retries; dark relights). ---
+					if (entry.retries >= maxPendingLightRetries) {
+						const task = main.globalAllocator.create(network.protocols.chunkTransmission.MeshGenerationTask);
+						task.* = .{
+							.pos = entry.pos,
+							.data = entry.data,
+							.forceBuild = true,
+						};
+						main.threadPool.addTask(task, &network.protocols.chunkTransmission.MeshGenerationTask.vtable);
+						_ = pendingLightMeshes.swapRemove(i);
+					} else {
+						pendingLightMeshes.items[i].atMs = nowMs;
+						pendingLightMeshes.items[i].retries += 1;
+					}
 				}
 			}
 		}
@@ -892,13 +920,68 @@ pub fn finishMesh(pos: chunk.ChunkPosition) void {
 	updatableList.append(main.globalAllocator, pos);
 }
 
+// --- ASHFRAME CUSTOM CLIENT: refresh built meshes covered by a newly
+// landed lightmap fragment. Called from the render thread (updateMeshes
+// holds `mutex`). Without this, a mesh built before its fragment arrived
+// stays dark: the stock pipeline only relights via block updates, and
+// the deferred retry only handles unbuilt entries. Same-vs chunks in the
+// fragment's 256*vs box, all z in render range; missing meshes skip. ---
+fn relightMeshesForFragment(fx: i32, fy: i32, vs: u31) void {
+	const span: i32 = 256*@as(i32, @intCast(vs));
+	const cs: i32 = 32*@as(i32, @intCast(vs));
+	const zExt: i32 = @as(i32, lastRD)*32*@as(i32, @intCast(vs));
+	var x = fx;
+	while (x < fx + span) : (x += cs) {
+		var y = fy;
+		while (y < fy + span) : (y += cs) {
+			var z = lastPz - zExt;
+			while (z <= lastPz + zExt) : (z += cs) {
+				const pos = chunk.ChunkPosition{ .wx = x, .wy = y, .wz = z, .voxelSize = vs };
+				if (getMesh(pos) != null) {
+					ChunkMesh.scheduleLightRefresh(pos);
+				}
+			}
+		}
+	}
+}
+
+// --- ASHFRAME CUSTOM CLIENT: near-field lightmap coverage for the
+// reveal gate. Counts fragments in the +-192 block box (same box the
+// connect prefetch warms) across all LODs vs how many are resident in
+// map storage. Render/main thread only; atomic loads, no locks. ---
+pub const NearCoverage = struct { total: u32, resident: u32 };
+
+pub fn nearLightCoverage(px: i32, py: i32) NearCoverage {
+	var total: u32 = 0;
+	var resident: u32 = 0;
+	const half: i32 = 192;
+	for (0..@as(usize, settings.highestLod) + 1) |_lod| {
+		const lod: u5 = @intCast(_lod);
+		const vs: u31 = @as(u31, 1) << lod;
+		const frag: i32 = @as(i32, LightMap.LightMapFragment.mapSize)*@as(i32, @intCast(vs));
+		var fx = (px - half) & ~(frag - 1);
+		const maxFx = (px + half) & ~(frag - 1);
+		while (fx <= maxFx) : (fx += frag) {
+			var fy = (py - half) & ~(frag - 1);
+			const maxFy = (py + half) & ~(frag - 1);
+			while (fy <= maxFy) : (fy += frag) {
+				total += 1;
+				if (getLightMapPiece(fx, fy, vs) != null) resident += 1;
+			}
+		}
+	}
+	return .{ .total = total, .resident = resident };
+}
+
 // --- ASHFRAME CUSTOM CLIENT: defer mesh creation until the lightmap
 // fragment exists, so meshes are never born dark. Called from mesh-build
 // worker threads; takes ownership of `data` on true. Returns false when
 // the pending list is full (caller falls back to the stock path).
 // The scan in updateMeshes retries entries once their fragment lands;
-// entries that outlive the wait (expiry) or leave render distance are
-// built/dropped there, so nothing stalls forever and nothing leaks.
+// entries that outlive the wait (expiry) re-stamp a few times, then build
+// anyway so nothing stalls forever; out-of-range entries drop. Relighting
+// of already-built meshes happens via relightMeshesForFragment, so dark
+// builds still converge to real light once their fragment lands.
 pub fn deferMeshForLightmap(pos: chunk.ChunkPosition, data: []const u8) bool {
 	mutex.lock();
 	defer mutex.unlock();

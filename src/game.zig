@@ -381,20 +381,14 @@ pub const World = struct { // MARK: World
 		self.entityComponentPalette = try assets.Palette.init(main.globalAllocator, zon.getChild("entityComponentPalette"), null);
 		errdefer self.entityComponentPalette.deinit();
 
-		// --- ASHFRAME CUSTOM CLIENT: asset unpack now runs on a worker so the
-		// handshake socket loop never stalls on it; wait here (serverAssets
-		// must exist before loadWorldAssets reads it). No-op when the pack
-		// was unchanged (flag already set).
+		// --- ASHFRAME CUSTOM CLIENT: unpack runs on a worker; wait here since
+		// loadWorldAssets needs serverAssets on disk. ---
 		try main.network.protocols.handShake.waitForAssetUnpack();
-		// --- ASHFRAME CUSTOM CLIENT: timing. ---
-		main.ashframe_client.timingMark("assets ready");
-		// --- ASHFRAME CUSTOM CLIENT ---
+		main.ashframe_client.timingMark("assets ready"); // ASHFRAME: timing
 		const path = main.stackAllocator.print("{s}/serverAssets", .{main.files.cubyzDirStr()});
 		defer main.stackAllocator.free(path);
 		try assets.loadWorldAssets(path, self.blockPalette, self.itemPalette, self.proceduralItemPalette, self.biomePalette, self.entityModelPalette, self.entityComponentPalette);
-		// --- ASHFRAME CUSTOM CLIENT: timing. ---
-		main.ashframe_client.timingMark("loadWorldAssets done");
-		// --- ASHFRAME CUSTOM CLIENT ---
+		main.ashframe_client.timingMark("loadWorldAssets done"); // ASHFRAME: timing
 		Player.id = @enumFromInt(zon.get(u32, "player_id") orelse @intFromEnum(main.entity.Entity.noValue));
 		Player.inventory = ClientInventory.init(main.globalAllocator, Player.inventorySize, .serverShared, .{.playerInventory = Player.id}, .{});
 		Player.setGamemode(std.enums.fromInt(Gamemode, zon.get(u8, "gamemode") orelse return error.Invalid) orelse return error.Invalid);
@@ -406,15 +400,11 @@ pub const World = struct { // MARK: World
 		main.particles.ParticleManager.generateTextureArray();
 		main.models.uploadModels();
 		main.entityModel.loadModelsAndTexture();
-		// --- ASHFRAME CUSTOM CLIENT: timing. ---
-		main.ashframe_client.timingMark("textures+models done");
-		// --- ASHFRAME CUSTOM CLIENT ---
+		main.ashframe_client.timingMark("textures+models done"); // ASHFRAME: timing
 
 		try Player.loadFrom(zon.getChild("player"));
 		main.network.protocols.handShake.signalLoadedAssets();
-		// --- ASHFRAME CUSTOM CLIENT: timing. ---
-		main.ashframe_client.timingMark("world visible");
-		// --- ASHFRAME CUSTOM CLIENT ---
+		main.ashframe_client.timingMark("world visible"); // ASHFRAME: timing
 
 		self.paused = false;
 	}

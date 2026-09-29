@@ -1505,20 +1505,23 @@ pub const Connection = struct { // MARK: Connection
 	hasRttEstimate: bool = false,
 	rttEstimate: f32 = 1000*ms,
 	rttUncertainty: f32 = 0.0,
+	// --- ASHFRAME CUSTOM CLIENT: display-only smoothed RTT. Median of the
+	// last 8 confirmation-batch averages, floored at 2 ms so timestamp
+	// quantisation can't flash 0 ms. Inert: the protocol never reads it. ---
+	rttDisplayHist: [8]f32 = @splat(20000.0),
+	rttDisplayIdx: u8 = 0,
+	rttDisplayCount: u8 = 0,
+	rttDisplayUs: f32 = 20000.0,
+	// --- ASHFRAME CUSTOM CLIENT ---
 	lastRttSampleTime: i64,
 	nextPacketTimestamp: i64,
 	nextConfirmationTimestamp: i64,
 	queuedConfirmations: main.utils.CircularBufferQueue(ConfirmationData),
 	mtuEstimate: u16 = minMtu,
 
-	// --- ASHFRAME CUSTOM CLIENT: start the reliable-channel congestion
-	// window at ~10x minMtu instead of 1x. Stock slow-start needs ~15
-	// round-trips to ramp for a 200 KB handshake payload; on a 150 ms link
-	// that is the entire join delay. Packet size (mtuEstimate) is untouched,
-	// so no fragmentation risk; only more small packets per RTT. Revert by
-	// restoring `= minMtu`. Benefits vanilla servers too (send pacing only).
+	// --- ASHFRAME CUSTOM CLIENT: ~10x initial congestion window (faster
+	// handshake ramp on slow links; packet size untouched, vanilla-safe). ---
 	bandwidthEstimateInBytesPerRtt: f32 = 10 * minMtu,
-	// --- ASHFRAME CUSTOM CLIENT ---
 	slowStart: bool = true,
 	relativeSendTime: i64 = 0,
 	relativeIdleTime: i64 = 0,
@@ -1674,6 +1677,28 @@ pub const Connection = struct { // MARK: Connection
 		}
 	}
 
+	// --- ASHFRAME CUSTOM CLIENT: display median, see rttDisplay fields. ---
+	fn noteRttDisplaySample(self: *Connection, sampleUs: f32) void {
+		const s = @max(sampleUs, 2000.0);
+		self.rttDisplayHist[self.rttDisplayIdx] = s;
+		self.rttDisplayIdx = (self.rttDisplayIdx + 1) % 8;
+		if (self.rttDisplayCount < 8) self.rttDisplayCount += 1;
+		var sorted: [8]f32 = undefined;
+		const n: usize = self.rttDisplayCount;
+		for (0..n) |i| sorted[i] = self.rttDisplayHist[i];
+		var i: usize = 1;
+		while (i < n) : (i += 1) {
+			var j = i;
+			while (j > 0 and sorted[j] < sorted[j - 1]) : (j -= 1) {
+				const tmp = sorted[j];
+				sorted[j] = sorted[j - 1];
+				sorted[j - 1] = tmp;
+			}
+		}
+		self.rttDisplayUs = if (n % 2 == 1) sorted[n/2] else (sorted[n/2 - 1] + sorted[n/2])/2.0;
+	}
+	// --- ASHFRAME CUSTOM CLIENT ---
+
 	fn increaseCongestionBandwidth(self: *Connection, packetLen: SequenceIndex) void {
 		const fullPacketLen: f32 = @floatFromInt(packetLen + headerOverhead);
 		if (self.slowStart) {
@@ -1713,6 +1738,10 @@ pub const Connection = struct { // MARK: Connection
 		if (numRtt > 0) {
 			// Taken mostly from RFC 6298 with some minor changes
 			const averageRtt = sumRtt/numRtt;
+			// --- ASHFRAME CUSTOM CLIENT: feed the display median. Must run
+			// under conn.mutex like the rest of this block. ---
+			self.noteRttDisplaySample(averageRtt);
+			// --- ASHFRAME CUSTOM CLIENT ---
 			const largestDifference = @max(maxRtt - averageRtt, averageRtt - minRtt, @abs(maxRtt - self.rttEstimate), @abs(self.rttEstimate - minRtt));
 			const timeDifference: f32 = @floatFromInt(timestamp -% self.lastRttSampleTime);
 			const alpha = 1.0 - std.math.pow(f32, 7.0/8.0, timeDifference/self.rttEstimate);
