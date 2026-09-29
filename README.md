@@ -21,8 +21,8 @@ behaves exactly like stock Cubyz 0.4.1.
 | Asset pack re-download | every join (~17–29 s) | skipped when unchanged |
 | Revisit / teleport back | full re-stream | instant from disk |
 | Dark shadows / night bright flash | yes | no |
-| Cached rejoin, first serve pass | streams | ~0.16 s for ~95k blobs |
-| Disk cache | re-downloads | ~93 MB for ~79 MB data |
+| Cached rejoin, first serve pass | streams | fast (one disk read per region file) |
+| Disk cache | re-downloads | capped, default 256 MB |
 | Extra RAM | — | ~128 MB cap + write buffer |
 | Chat width | 256 px fixed | configurable |
 
