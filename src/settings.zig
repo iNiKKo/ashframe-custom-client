@@ -227,6 +227,10 @@ pub const launchConfig = struct {
 	pub var ashframeFlushIntervalMinutes: u32 = 5;
 	/// On-disk per-server budget (MB). Random eviction down to 4/5 of cap.
 	pub var ashframeCacheMaxMB: u32 = 1024;
+	/// Extra diagnostic logs ([timing] join stages, cache decisions).
+	pub var ashframeDebug: bool = true;
+	/// Chat window width in px (text wraps at this width).
+	pub var chatWidth: f32 = 480;
 
 	pub fn init() void {
 		const zon: ZonElement = main.files.cwd().readToZon(main.stackAllocator, "launchConfig.zon") catch |err| blk: {
@@ -247,6 +251,8 @@ pub const launchConfig = struct {
 		ashframeFlushMaxMB = zon.get(u32, "ashframeFlushMaxMB") orelse ashframeFlushMaxMB;
 		ashframeFlushIntervalMinutes = zon.get(u32, "ashframeFlushIntervalMinutes") orelse ashframeFlushIntervalMinutes;
 		ashframeCacheMaxMB = zon.get(u32, "ashframeCacheMaxMB") orelse ashframeCacheMaxMB;
+		ashframeDebug = zon.get(bool, "ashframeDebug") orelse ashframeDebug;
+		chatWidth = zon.get(f32, "chatWidth") orelse chatWidth;
 		// --- ASHFRAME CUSTOM CLIENT ---
 	}
 };

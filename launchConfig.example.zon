@@ -1,0 +1,16 @@
+.{
+    .cubyzDir = "",
+    .autoEnterWorld = "",
+    .headlessServer = false,
+    // .preferredAuthenticationAlgorithm = .ed25519, // Uncomment and change this if you own a server in an outdated game version where the default algorithm got compromised.
+
+    // --- Ashframe Custom Client (copy these into your launchConfig.zon) ---
+    .ashframeCache = true, // master toggle for the per-server caches
+    .ashframeServer = "cubyz.ashframe.net", // caches only apply to this server
+    .ashframeCacheTTLHours = 24, // drop cached data older than this
+    .ashframeFlushMaxMB = 124, // RAM write buffer: flush to disk past this
+    .ashframeFlushIntervalMinutes = 5, // ...or past this age, whichever first
+    .ashframeCacheMaxMB = 1024, // on-disk per-server budget, then evict
+    .ashframeDebug = true, // [timing] join logs + cache info lines
+    .chatWidth = 480, // chat window width in px (256..1200)
+}

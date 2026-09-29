@@ -21,10 +21,17 @@ pub fn timingReset() void {
 }
 
 pub fn timingMark(stage: []const u8) void {
+	if (!main.settings.launchConfig.ashframeDebug) return;
 	const now = main.timestamp().toMilliseconds();
 	if (timingStartMs == 0) timingReset();
 	std.log.info("[timing] {s}: +{d}ms (total {d}ms)", .{ stage, now - timingLastMs, now - timingStartMs });
 	timingLastMs = now;
+}
+
+/// Info-level cache chatter, gated behind `ashframeDebug`. Errors log always.
+pub fn infoLog(comptime fmt: []const u8, args: anytype) void {
+	if (!main.settings.launchConfig.ashframeDebug) return;
+	std.log.info("[ashframe] " ++ fmt, args);
 }
 
 /// Remembers the typed server address. Called from the connecting window.
@@ -157,7 +164,7 @@ pub fn checkAssetPack(packData: []const u8) PackStatus {
 	const ttlMs: i64 = @as(i64, @intCast(main.settings.launchConfig.ashframeCacheTTLHours))*60*60*1000;
 	if (readMetaTs(dir)) |ts| {
 		if (ttlMs > 0 and nowMs -% ts > ttlMs) {
-			std.log.info("Ashframe cache: expired (older than {d}h), flushing.", .{main.settings.launchConfig.ashframeCacheTTLHours});
+			infoLog("cache: expired (older than {d}h), flushing.", .{main.settings.launchConfig.ashframeCacheTTLHours});
 			ramClear();
 			cubyz.deleteTree(dirPath) catch {};
 			cubyz.makePath(dirPath) catch return .off;
@@ -168,7 +175,7 @@ pub fn checkAssetPack(packData: []const u8) PackStatus {
 		}
 	}
 	if (clientVersionMismatch(dir)) {
-		std.log.info("Ashframe cache: client version changed, flushing chunk cache.", .{});
+		infoLog("cache: client version changed, flushing chunk cache.", .{});
 		ramClear();
 		cubyz.deleteTree(dirPath) catch {};
 		cubyz.makePath(dirPath) catch return .off;
@@ -183,7 +190,7 @@ pub fn checkAssetPack(packData: []const u8) PackStatus {
 		const old = z.get(i64, "packHash");
 		if (old != null and old.? == @as(i64, @bitCast(h))) return .unchanged;
 	}
-	std.log.info("Ashframe cache: asset pack changed, flushing chunk cache.", .{});
+	infoLog("cache: asset pack changed, flushing chunk cache.", .{});
 	ramClear();
 	cubyz.deleteTree(dirPath) catch {};
 	cubyz.makePath(dirPath) catch return .off;
@@ -225,10 +232,16 @@ fn cacheMaxBytes() usize {
 }
 
 threadlocal var sweepCounter: u32 = 0;
+var lastSweepMs: std.atomic.Value(i64) = .init(0);
 
+/// Full directory scan + stat of every blob is expensive at 100k+ files, so
+/// sweeps run at most once a minute on top of the store-count cadence.
 fn maybeSweep(dirPath: []const u8) void {
 	sweepCounter +%= 1;
 	if (sweepCounter % 2048 != 0) return;
+	const nowMs = main.timestamp().toMilliseconds();
+	if (nowMs -% lastSweepMs.load(.monotonic) < 60*1000) return;
+	lastSweepMs.store(nowMs, .monotonic);
 	const cubyz = main.files.cubyzDir();
 	var dir = cubyz.openDir(dirPath) catch return;
 	defer dir.close();

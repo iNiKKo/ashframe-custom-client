@@ -191,7 +191,7 @@ pub const handShake = struct { // MARK: handShake
 					// cache is current, nothing to unpack. Only ever sent in
 					// reply to an announcement, so vanilla flow is untouched.
 					if (reader.remaining.len == 0 and main.ashframe_client.isActive()) {
-						std.log.info("Ashframe client: server confirmed cached pack, skipping.", .{});
+						main.ashframe_client.infoLog("client: server confirmed cached pack, skipping.", .{});
 						// --- ASHFRAME CUSTOM CLIENT: timing. ---
 						main.ashframe_client.timingMark("assets pack skipped (server-confirmed)");
 						// --- ASHFRAME CUSTOM CLIENT ---
@@ -199,7 +199,7 @@ pub const handShake = struct { // MARK: handShake
 						assetsUnpackFailed.store(false, .release);
 					} else if (main.ashframe_client.checkAssetPack(reader.remaining) == .unchanged) {
 						// --- ASHFRAME CUSTOM CLIENT: skip unpack if pack unchanged. ---
-						std.log.info("Ashframe client: asset pack unchanged, keeping serverAssets.", .{});
+						main.ashframe_client.infoLog("client: asset pack unchanged, keeping serverAssets.", .{});
 						// --- ASHFRAME CUSTOM CLIENT: timing. ---
 						main.ashframe_client.timingMark("assets unpack skipped (cached)");
 						// --- ASHFRAME CUSTOM CLIENT ---
